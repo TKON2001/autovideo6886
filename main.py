@@ -3,12 +3,14 @@ import logging
 import os
 import sys
 import time
+import traceback
 import tracemalloc
 import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from telegram import BotCommand, Update
+from telegram.error import TimedOut, TelegramError
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -16,6 +18,7 @@ from telegram.ext import (
     ContextTypes,
     TypeHandler,
 )
+from telegram.request import HTTPXRequest
 
 from ai_service import create_image, create_video_plan, create_voice, get_video_mode
 from config import get_settings, is_admin
@@ -1377,36 +1380,147 @@ async def run_video_request(
     )
 
 
-async def send_video_with_retry(app, job: QueueVideoJob, video_path: Path, caption: str) -> None:
-    attempts = settings.telegram_send_retry_count + 1
-    for attempt in range(1, attempts + 1):
+async def send_video_with_retry(
+    app, job: QueueVideoJob, video_path: Path, caption: str
+) -> None:
+    """
+    Send video with retry logic and fallback to document send.
+    
+    Retry strategy:
+    - Attempt 1: wait 5 seconds before retry
+    - Attempt 2: wait 15 seconds before retry
+    - Attempt 3: wait 30 seconds before final attempt
+    - Fallback: if all send_video attempts fail, try send_document as file
+    """
+    delays = [5, 15, 30]
+    max_attempts = len(delays)
+
+    # Try sending as video with retries
+    for attempt in range(1, max_attempts + 1):
         try:
             with open(video_path, "rb") as video_file:
-                await app.bot.send_video(
+                result = await app.bot.send_video(
                     chat_id=job.chat_id,
                     video=video_file,
                     caption=caption,
                     width=VIDEO_WIDTH,
                     height=VIDEO_HEIGHT,
                     supports_streaming=True,
+                    read_timeout=settings.telegram_read_timeout,
+                    write_timeout=settings.telegram_write_timeout,
+                    connect_timeout=settings.telegram_connect_timeout,
+                    pool_timeout=settings.telegram_pool_timeout,
                 )
-            return
-        except Exception:
-            logger.exception(
-                "video_send_attempt_failed job_id=%s attempt=%s/%s",
+                logger.info(
+                    "video_send_success job_id=%s attempt=%s",
+                    job.job_id,
+                    attempt,
+                )
+                return
+        except TimedOut as exc:
+            logger.warning(
+                "video_send_timeout job_id=%s attempt=%s/%s error=%s",
                 job.job_id,
                 attempt,
-                attempts,
+                max_attempts,
+                exc,
             )
-            if attempt >= attempts:
-                raise
-            await asyncio.sleep(3)
+            traceback.print_exc()
+            if attempt < max_attempts:
+                wait_time = delays[attempt - 1]
+                logger.info(
+                    "video_send_retry job_id=%s attempt=%s waiting=%s_sec",
+                    job.job_id,
+                    attempt,
+                    wait_time,
+                )
+                await asyncio.sleep(wait_time)
+                continue
+
+        except TelegramError as exc:
+            logger.warning(
+                "video_send_telegram_error job_id=%s attempt=%s/%s error=%s",
+                job.job_id,
+                attempt,
+                max_attempts,
+                exc,
+            )
+            traceback.print_exc()
+            if attempt < max_attempts:
+                wait_time = delays[attempt - 1]
+                logger.info(
+                    "video_send_retry job_id=%s attempt=%s waiting=%s_sec",
+                    job.job_id,
+                    attempt,
+                    wait_time,
+                )
+                await asyncio.sleep(wait_time)
+                continue
+
+        except Exception as exc:
+            logger.exception(
+                "video_send_unexpected_error job_id=%s attempt=%s/%s",
+                job.job_id,
+                attempt,
+                max_attempts,
+            )
+            if attempt < max_attempts:
+                wait_time = delays[attempt - 1]
+                logger.info(
+                    "video_send_retry job_id=%s attempt=%s waiting=%s_sec",
+                    job.job_id,
+                    attempt,
+                    wait_time,
+                )
+                await asyncio.sleep(wait_time)
+                continue
+
+    # Fallback: send as document if video send fails after all retries
+    logger.info(
+        "video_send_all_retries_failed job_id=%s attempting_fallback_document_send",
+        job.job_id,
+    )
+    try:
+        with open(video_path, "rb") as video_file:
+            result = await app.bot.send_document(
+                chat_id=job.chat_id,
+                document=video_file,
+                caption="Video của bạn đã tạo xong. Telegram gửi dưới dạng file do kết nối gửi video bị chậm.",
+                read_timeout=settings.telegram_read_timeout,
+                write_timeout=settings.telegram_write_timeout,
+                connect_timeout=settings.telegram_connect_timeout,
+                pool_timeout=settings.telegram_pool_timeout,
+            )
+            logger.info(
+                "video_send_document_fallback_success job_id=%s",
+                job.job_id,
+            )
+            return
+    except Exception as exc:
+        logger.exception(
+            "video_send_document_fallback_failed job_id=%s error=%s",
+            job.job_id,
+            exc,
+        )
+        raise
 
 
 async def process_video_job(app, job: QueueVideoJob, worker_id: int) -> None:
+    """
+    Process video job with proper separation of generation and sending phases.
+    
+    Flow:
+    1. Generate video (with retries on generation failures)
+    2. Quality check - if fails, regenerate
+    3. Mark as "rendered" when video generation + QC passed
+    4. Send video to Telegram (with retries and fallback)
+    5. Only on SEND failures, do NOT regenerate - only retry sending
+    6. Deduct credits only after successful send
+    """
     attempts = settings.job_retry_count + 1
     status = None
     mode_config = get_video_mode(job.quality)
+    video_path = None
 
     logger.info(
         "video_job_processing worker_id=%s job_id=%s user_id=%s",
@@ -1424,19 +1538,25 @@ async def process_video_job(app, job: QueueVideoJob, worker_id: int) -> None:
         ),
     )
 
-    for attempt in range(1, attempts + 1):
+    # PHASE 1: VIDEO GENERATION (with retries)
+    for gen_attempt in range(1, attempts + 1):
         progress = ProgressReporter(
             message=status,
             estimated_total_seconds=estimate_total_seconds(10),
         )
         try:
-            if attempt > 1:
+            if gen_attempt > 1:
                 await safe_edit_message(
                     status,
-                    f"Đang thử xử lý lại video.\nMã job: {job.job_id}\nLần thử: {attempt}/{attempts}",
+                    f"Đang thử tạo video lại.\nMã job: {job.job_id}\nLần thử: {gen_attempt}/{attempts}",
                 )
                 update_job_status(job.job_id, "processing", error_message=None)
 
+            logger.info(
+                "video_generate_start job_id=%s attempt=%s",
+                job.job_id,
+                gen_attempt,
+            )
             video_path = await generate_video(
                 job.topic,
                 job.quality,
@@ -1455,6 +1575,15 @@ async def process_video_job(app, job: QueueVideoJob, worker_id: int) -> None:
                     job.job_id,
                     "; ".join(errors),
                 )
+                if gen_attempt < attempts:
+                    logger.info(
+                        "video_quality_retry job_id=%s attempt=%s",
+                        job.job_id,
+                        gen_attempt,
+                    )
+                    await asyncio.sleep(5)
+                    continue
+
                 mark_job_failed(
                     job.job_id,
                     f"Quality validation failed: {'; '.join(errors)}",
@@ -1466,62 +1595,22 @@ async def process_video_job(app, job: QueueVideoJob, worker_id: int) -> None:
                 )
                 return
 
-            try:
-                update_job_state(job.job_id, "output", status="processing", progress_percent=96)
-            except Exception as exc:
-                logger.exception("job_state_update_failed job_id=%s error=%s", job.job_id, exc)
-
-            await progress.update("Đang gửi video", 97, force=True)
-            logger.info("video_send_start job_id=%s user_id=%s path=%s", job.job_id, job.telegram_user_id, video_path)
-
-            account = get_user(job.telegram_user_id)
-            current_balance = int(account["credit_balance"]) if account else 0
-            if current_balance < job.required_credits:
-                mark_job_failed(job.job_id, "Insufficient credits before sending video")
-                await safe_edit_message(
-                    status,
-                    "❌ Số dư credit hiện tại không đủ để gửi video.\n\n"
-                    "Credit chưa bị trừ. Vui lòng nạp thêm credit rồi tạo lại video.",
-                )
-                return
-
-            await send_video_with_retry(
-                app,
-                job,
-                video_path,
-                caption=f"{mode_config['label'].title()}: {job.topic}",
-            )
-
-            new_balance = deduct_credits(
-                job.telegram_user_id,
-                job.required_credits,
-                description=f"{mode_config['label']}: {job.topic}",
-            )
-            mark_job_completed(job.job_id, str(video_path))
-            await safe_edit_message(
-                status,
-                f"✅ Hoàn tất. Đã trừ {job.required_credits} credits.\n"
-                f"Số dư còn lại: {new_balance} credits.",
-            )
             logger.info(
-                "video_job_completed job_id=%s user_id=%s cost=%s new_balance=%s",
+                "video_quality_pass job_id=%s path=%s",
                 job.job_id,
-                job.telegram_user_id,
-                job.required_credits,
-                new_balance,
+                video_path,
             )
-            return
+            # Video generation and quality check passed!
+            break
 
         except Exception as exc:
             logger.exception(
-                "video_job_attempt_failed worker_id=%s job_id=%s attempt=%s/%s error=%s",
-                worker_id,
+                "video_generate_attempt_failed job_id=%s attempt=%s/%s",
                 job.job_id,
-                attempt,
+                gen_attempt,
                 attempts,
-                exc,
             )
-            if attempt < attempts:
+            if gen_attempt < attempts:
                 await asyncio.sleep(5)
                 continue
 
@@ -1540,6 +1629,95 @@ async def process_video_job(app, job: QueueVideoJob, worker_id: int) -> None:
                 ),
             )
             return
+
+    if video_path is None:
+        mark_job_failed(job.job_id, "Video path is None after generation")
+        await safe_edit_message(
+            status,
+            "❌ Lỗi khi tạo video: không thể xác định đường dẫn file.\n\n"
+            "Credit chưa bị trừ. Vui lòng thử lại.",
+        )
+        return
+
+    # Update job state after successful generation and QC
+    try:
+        update_job_state(job.job_id, "output", status="rendered", progress_percent=96)
+    except Exception as exc:
+        logger.exception("job_state_update_failed job_id=%s error=%s", job.job_id, exc)
+
+    # PHASE 2: VIDEO SENDING (no regeneration on failures)
+    await progress.update("Đang gửi video", 97, force=True)
+    logger.info(
+        "video_send_start job_id=%s user_id=%s path=%s",
+        job.job_id,
+        job.telegram_user_id,
+        video_path,
+    )
+
+    try:
+        account = get_user(job.telegram_user_id)
+        current_balance = int(account["credit_balance"]) if account else 0
+        if current_balance < job.required_credits:
+            mark_job_failed(job.job_id, "Insufficient credits before sending video")
+            await safe_edit_message(
+                status,
+                "❌ Số dư credit hiện tại không đủ để gửi video.\n\n"
+                "Credit chưa bị trừ. Vui lòng nạp thêm credit rồi tạo lại video.",
+            )
+            return
+
+        # Try sending video (with retries and fallback)
+        await send_video_with_retry(
+            app,
+            job,
+            video_path,
+            caption=f"{mode_config['label'].title()}: {job.topic}",
+        )
+
+        # Video successfully sent - now deduct credits
+        new_balance = deduct_credits(
+            job.telegram_user_id,
+            job.required_credits,
+            description=f"{mode_config['label']}: {job.topic}",
+        )
+        mark_job_completed(job.job_id, str(video_path))
+        await safe_edit_message(
+            status,
+            f"✅ Hoàn tất. Đã trừ {job.required_credits} credits.\n"
+            f"Số dư còn lại: {new_balance} credits.",
+        )
+        logger.info(
+            "video_job_completed job_id=%s user_id=%s cost=%s new_balance=%s",
+            job.job_id,
+            job.telegram_user_id,
+            job.required_credits,
+            new_balance,
+        )
+
+    except Exception as exc:
+        # Send failed - mark as failed but keep video for manual retry
+        logger.exception(
+            "video_send_failed job_id=%s error=%s",
+            job.job_id,
+            exc,
+        )
+        mark_job_failed(
+            job.job_id,
+            f"Video send failed: {str(exc)}",
+        )
+        await safe_edit_message(
+            status,
+            "❌ Video đã tạo xong nhưng gửi file lên Telegram bị lỗi mạng.\n\n"
+            "Credit chưa bị trừ.\n"
+            "Admin sẽ kiểm tra lại. Vui lòng chờ hoặc thử tạo video mới.",
+        )
+        await app.bot.send_message(
+            chat_id=job.chat_id,
+            text=(
+                f"Job {job.job_id} tạo video thành công nhưng gửi Telegram thất bại.\n"
+                "Credit chưa bị trừ."
+            ),
+        )
 
 
 async def makevideo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1661,9 +1839,25 @@ def main():
     logger.info("bot_starting")
     init_database()
 
+    # Configure Telegram request with extended timeouts for video uploads
+    request = HTTPXRequest(
+        connect_timeout=settings.telegram_connect_timeout,
+        read_timeout=settings.telegram_read_timeout,
+        write_timeout=settings.telegram_write_timeout,
+        pool_timeout=settings.telegram_pool_timeout,
+    )
+    logger.info(
+        "telegram_request_config connect_timeout=%s read_timeout=%s write_timeout=%s pool_timeout=%s",
+        settings.telegram_connect_timeout,
+        settings.telegram_read_timeout,
+        settings.telegram_write_timeout,
+        settings.telegram_pool_timeout,
+    )
+
     app = (
         ApplicationBuilder()
         .token(settings.telegram_bot_token)
+        .request(request)
         .post_init(setup_bot_commands)
         .build()
     )

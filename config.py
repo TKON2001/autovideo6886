@@ -31,6 +31,10 @@ class Settings:
     sqlite_timeout_seconds: int
     telegram_send_retry_count: int
     makevideo_cooldown_seconds: int
+    telegram_connect_timeout: int
+    telegram_read_timeout: int
+    telegram_write_timeout: int
+    telegram_pool_timeout: int
 
 
 def _parse_admin_ids(value: str | None) -> tuple[int, ...]:
@@ -107,4 +111,8 @@ def get_settings() -> Settings:
         sqlite_timeout_seconds=_get_int_env("SQLITE_TIMEOUT_SECONDS", 30, minimum=1),
         telegram_send_retry_count=_get_int_env("TELEGRAM_SEND_RETRY_COUNT", 2, minimum=0),
         makevideo_cooldown_seconds=_get_int_env("MAKEVIDEO_COOLDOWN_SECONDS", 30, minimum=0),
+        telegram_connect_timeout=_get_int_env("TELEGRAM_CONNECT_TIMEOUT", 30, minimum=5),
+        telegram_read_timeout=_get_int_env("TELEGRAM_READ_TIMEOUT", 180, minimum=30),
+        telegram_write_timeout=_get_int_env("TELEGRAM_WRITE_TIMEOUT", 300, minimum=60),
+        telegram_pool_timeout=_get_int_env("TELEGRAM_POOL_TIMEOUT", 60, minimum=10),
     )
